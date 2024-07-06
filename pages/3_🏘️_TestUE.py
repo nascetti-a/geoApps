@@ -59,6 +59,8 @@ def generateMap():
 
     return m
 
+#TO DO check bidirectional map
+
 # src = rio.open("/Users/andreanascetti/PycharmProjects/geoApps/planet_scope.tif")
 # array = src.read()
 # bounds = src.bounds
