@@ -1,12 +1,206 @@
-import ee
 import math
+import time
+import ee
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from collections import OrderedDict
+import torch
 import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+from tqdm.notebook import tqdm
+import rasterio
+from rasterio.transform import from_bounds
+from rasterio.crs import CRS as rasterio_CRS
 
+
+class ROIProcessor:
+    """
+    A class to process satellite imagery data from Sentinel-1 and Sentinel-2 using a deep learning model.
+
+    The ROIProcessor class encapsulates the workflow of defining a region of interest (ROI), fetching data from
+    Sentinel-1 and Sentinel-2 satellite imagery, and processing this data using a pre-trained deep learning model
+    for scene inference.
+
+    Attributes:
+        ROI (ee.Geometry): The region of interest defined by a polygon.
+        processing (appcore): The application core instance for processing.
+        CRS (str): The coordinate reference system for the ROI.
+        T1 (ee.Date): The start date for the data fetching period.
+        T2 (ee.Date): The end date for the data fetching period (one year after T1).
+        s1 (ee.ImageCollection): The Sentinel-1 image collection.
+        s2 (ee.ImageCollection): The Sentinel-2 image collection.
+        s1_bands (numpy.ndarray): The processed bands from the Sentinel-1 data.
+        s2_bands (numpy.ndarray): The processed bands from the Sentinel-2 data.
+        model_path (str): The file path to the pre-trained model checkpoint.
+        tile_size (int): The size of the tiles for scene inference.
+        device (torch.device): The device to run the model on (CUDA, MPS, or CPU).
+        net (torch.nn.Module): The loaded deep learning model for scene inference.
+
+    Methods:
+        __init__(poly, start_date="2020", model_path='weights/fusionda_10m_checkpoint15.pt', tile_size=256):
+            Initializes the ROIProcessor with the given polygon, start date, model path, and tile size.
+
+        load_model():
+            Loads the pre-trained deep learning model.
+
+        fetch_data():
+            Fetches and processes Sentinel-1 and Sentinel-2 data for the defined ROI and time period.
+
+        process_data():
+            Processes the fetched data using the loaded model and performs scene inference.
+
+        visualize_results(pred, s2, dataset):
+            Visualizes the results of the scene inference along with the Sentinel-2 imagery.
+
+        save_as_geotiff(pred, output_path):
+            Saves the inference result as a GeoTIFF file.
+
+        run():
+            Orchestrates the entire processing workflow from data fetching to visualization and measures execution time.
+
+    Usage:
+        poly = ...  # Define your polygon coordinates here
+        processor = ROIProcessor(poly)
+        processor.run()
+    """
+
+    def __init__(self, poly, start_date="2020", model_path='weights/fusionda_10m_checkpoint15.pt', tile_size=256):
+        self.ROI = ee.Geometry(poly)
+        self.processing = appcore(self.ROI)
+        self.CRS = self.processing.getUtmCRS()
+        self.T1 = ee.Date(start_date)
+        self.T2 = self.T1.advance(1, "year")
+        self.s1 = None
+        self.s2 = None
+        self.s1_bands = None
+        self.s2_bands = None
+        self.model_path = model_path
+        self.tile_size = tile_size
+        self.device = self.select_device()
+        self.net = self.load_model()
+
+    def select_device(self):
+        if torch.cuda.is_available():
+            print("CUDA device found. Using GPU.")
+            return torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            print("MPS device found. Using Apple Silicon GPU.")
+            return torch.device("mps")
+        else:
+            print("No GPU found. Using CPU.")
+            return torch.device("cpu")
+
+    def load_model(self):
+        return load_checkpoint(self.model_path, self.device)
+
+    def fetch_data(self):
+        self.s1 = self.processing.generateSentinel1Data(self.T1, self.T2)
+        self.s2 = self.processing.generateSentinel2Data(self.T1, self.T2)
+        s1clip = self.s1.clip(self.ROI)
+        s2clip = self.s2.clip(self.ROI)
+
+        s2_ds = xr.open_dataset(
+            ee.ImageCollection(s2clip),
+            engine='ee',
+            crs=self.CRS,
+            scale=10,
+            geometry=self.ROI
+        )
+
+        s1_ds = xr.open_dataset(
+            ee.ImageCollection(s1clip),
+            engine='ee',
+            crs=self.CRS,
+            scale=10,
+            geometry=self.ROI
+        )
+
+        #TO DO fix exporting and saving S1 and S2 data
+        s1_ds.VV.rename({"X": "x", "Y": 'y'}).transpose('time', 'y', 'x').rio.to_raster("planet_scope.tif")
+
+        self.s1_bands = s1_ds.to_array().to_numpy().squeeze()
+        self.s2_bands = s2_ds.to_array().to_numpy().squeeze()
+
+        print(self.s1_bands.shape)
+        print(self.s2_bands.shape)
+
+    def process_data(self):
+        s1 = np.nan_to_num(self.s1_bands.transpose((1, 2, 0))).astype(np.float32)
+        s2 = np.nan_to_num(self.s2_bands.transpose((1, 2, 0))).astype(np.float32)
+        dataset = SceneInferenceDataset(s1, s2, self.tile_size)
+        pred = dataset.get_arr()
+
+        self.net.eval()
+        for index in tqdm(range(len(dataset))):
+            tile = dataset.__getitem__(index)
+            x_s1, x_s2 = tile['x_s1'], tile['x_s2']
+            i, j = tile['i'], tile['j']
+
+            with torch.no_grad():
+                logits = self.net(x_s1.unsqueeze(0).to(self.device), x_s2.unsqueeze(0).to(self.device))
+
+            y_pred = torch.sigmoid(logits).detach()
+            y_pred = y_pred.squeeze().cpu().squeeze().numpy()
+            y_pred = y_pred[self.tile_size:2 * self.tile_size, self.tile_size: 2 * self.tile_size]
+            y_pred = np.clip(y_pred * 100, 0, 100).astype(np.uint8)
+            pred[i:i + self.tile_size, j:j + self.tile_size] = y_pred
+
+        self.visualize_results(pred, s2, dataset)
+        self.save_as_geotiff(pred.transpose(), "output.tif")
+
+    def visualize_results(self, pred, s2, dataset):
+        fig, axs = plt.subplots(1, 2, figsize=(20, 10))
+        fig.tight_layout()
+        for ax in axs:
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        s2_rgb = s2[:dataset.m, :dataset.n, [2, 1, 0]]
+        axs[0].imshow(np.clip(s2_rgb / 0.4, 0, 1))
+        axs[1].imshow(pred.transpose(), cmap='gray')
+        fig.show()
+
+        plt.imshow(pred)
+        plt.show()
+
+        print(pred.shape)
+
+    # reading in geotiff file as numpy array
+    def read_tif(self, file):
+        with rasterio.open(file) as dataset:
+            arr = dataset.read()  # (bands X height X width)
+            transform = dataset.transform
+            crs = dataset.crs
+        return arr.transpose((1, 2, 0)), transform, crs
+
+    def save_as_geotiff(self, pred, output_path):
+
+        data, tt, crs = self.read_tif('planet_scope.tif')
+        # Transform the ROI geometry to a bounding box
+        if len(pred.shape) == 3:
+            height, width, bands = pred.shape
+        else:
+            height, width = pred.shape
+            bands = 1
+            pred = pred[:, :, None]
+        with rasterio.open(output_path, 'w', driver='GTiff', height=height, width=width,
+                           count=bands, dtype=pred.dtype, crs=crs,
+                           transform=tt,
+                           ) as dst:
+            for i in range(bands):
+                dst.write(pred[:, :, i], i + 1)
+
+        print(f"Inference saved as GeoTIFF: {output_path}")
+
+    def run(self):
+        start = time.time()
+        self.fetch_data()
+        self.process_data()
+        end = time.time()
+        print("Processing time:", end - start)
 
 
 class appcore():
